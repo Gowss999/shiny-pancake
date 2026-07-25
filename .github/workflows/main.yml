@@ -12,22 +12,22 @@ jobs:
       - name: Enable Remote Desktop
         shell: powershell
         run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                           -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
           Restart-Service TermService -Force
 
       - name: Create User
         shell: powershell
         run: |
-          $password = ConvertTo-SecureString "Megamind#999" -AsPlainText -Force
+          $password = ConvertTo-SecureString "Ahmad123" -AsPlainText -Force
           if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
               New-LocalUser -Name "RDP" -Password $password -AccountNeverExpires
           }
           Add-LocalGroupMember -Group "Administrators" -Member "RDP"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-          echo "USERNAME=RDP" >> $env:GITHUB_ENV
-          echo "PASSWORD=Ahmad123" >> $env:GITHUB_ENV
+          
+          "RDP_USER=RDP" | Add-Content -Path $env:GITHUB_ENV
+          "RDP_PASS=Ahmad123" | Add-Content -Path $env:GITHUB_ENV
 
       - name: Install Tailscale
         shell: powershell
@@ -36,14 +36,63 @@ jobs:
           $file = "$env:TEMP\tailscale.msi"
           Invoke-WebRequest $url -OutFile $file
           Start-Process msiexec.exe -ArgumentList @("/i", $file, "/quiet", "/norestart") -Wait
+          Remove-Item $file -Force
 
       - name: Connect Tailscale
         shell: powershell
         run: |
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }}
-          Start-Sleep -Seconds 10
-          $ip = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-          echo "TS_IP=$ip" >> $env:GITHUB_ENV
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname="gh-runner-$env:GITHUB_RUN_ID"
+          
+          $ip = $null
+          $retries = 0
+          while (-not $ip -and $retries -lt 12) {
+              $ip = (& "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4).Trim()
+              if (-not $ip) {
+                  Start-Sleep -Seconds 5
+                  $retries++
+              }
+          }
+          
+          if (-not $ip) {
+              Write-Error "Tailscale IP assignment timed out!"
+              exit 1
+          }
+          
+          "TS_IP=$ip" | Add-Content -Path $env:GITHUB_ENV
+
+      - name: Install Google Chrome & Launch Tabs
+        shell: powershell
+        run: |
+          # Download and install Google Chrome
+          $chromeInstaller = "$env:TEMP\chrome_installer.exe"
+          Invoke-WebRequest "https://dl.google.com/chrome/install/latest/chrome_installer.exe" -OutFile $chromeInstaller
+          Start-Process $chromeInstaller -ArgumentList "/silent", "/install" -Wait
+          Remove-Item $chromeInstaller -Force
+
+          # List of websites to open
+          $urls = @(
+              "https://www.google.com",
+              "https://web.whatsapp.com/",
+              "https://chatgpt.com/",
+              "https://www.perplexity.ai/",
+              "https://apseva.ap.gov.in/#/home"
+          )
+
+          # Find Chrome executable path
+          $chromePath = "${env:ProgramFiles}\Google\Chrome\Application\chrome.exe"
+          if (-not (Test-Path $chromePath)) {
+              $chromePath = "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe"
+          }
+
+          # Launch Chrome with all tabs
+          if (Test-Path $chromePath) {
+              Start-Process $chromePath -ArgumentList $urls
+          } else {
+              # Fallback to default browser if Chrome installation path is not found
+              foreach ($url in $urls) {
+                  Start-Process $url
+              }
+          }
 
       - name: Show Connection Info
         shell: powershell
@@ -51,10 +100,11 @@ jobs:
           Write-Host ""
           Write-Host "====== RDP CONNECTION DETAILS ======"
           Write-Host "IP Address : $env:TS_IP"
-          Write-Host "Username   : $env:USERNAME"
-          Write-Host "Password   : $env:PASSWORD"
+          Write-Host "Username   : $env:RDP_USER"
+          Write-Host "Password   : $env:RDP_PASS"
           Write-Host "===================================="
           Write-Host ""
+          [Console]::Out.Flush()
 
       - name: Keep Runner Alive
         shell: powershell
