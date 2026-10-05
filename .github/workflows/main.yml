@@ -26,13 +26,13 @@ jobs:
           netsh advfirewall firewall add rule name="RDP-Tailscale" `
             dir=in action=allow protocol=TCP localport=3389
 
-          # (Optional) Restart the Remote Desktop service to ensure changes take effect
+          # Restart the Remote Desktop service to ensure changes take effect
           Restart-Service -Name TermService -Force
 
       - name: Create RDP User with Static Password
         run: |
           $password = '786gs$Az9_:1'
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          $securePass = ConvertTo-SecureString$password -AsPlainText -Force
 
           # Create the RDP user with the specified static password
           New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
@@ -46,12 +46,32 @@ jobs:
               exit 1
           }
 
+      - name: Install Software (LibreOffice, SumatraPDF, OmniRoute, Claude Code)
+        run: |
+          # 1. Install LibreOffice and SumatraPDF via Chocolatey
+          choco install libreoffice-fresh sumatrapdf -y --no-progress
+
+          # 2. Install Node.js & Claude Code CLI (@anthropic-ai/claude-code)
+          choco install nodejs-lts -y --no-progress
+          $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+          npm install -g @anthropic-ai/claude-code
+
+          # 3. Install OmniRoute
+          npm install -g omniroute || pip install omniroute || Write-Host "OmniRoute installation fallback"
+
+          # 4. Create Desktop Shortcut for Google Anti-Gravity
+          $desktopPath = [Environment]::GetFolderPath("CommonDesktopDirectory")
+          $wshell = New-Object -ComObject WScript.Shell
+          $shortcut = $wshell.CreateShortcut("$desktopPath\Google Anti-Gravity.url")
+          $shortcut.TargetPath = "https://mrdoob.com/projects/chromeexperiments/google-space/"
+          $shortcut.Save()
+
       - name: Install Tailscale
         run: |
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
           
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Invoke-WebRequest -Uri $tsUrl -OutFile$installerPath
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
 
@@ -61,9 +81,8 @@ jobs:
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
           
           # Wait for Tailscale to assign an IP
-          $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
+          $tsIP = $null$retries = 0
+          while (-not $tsIP -and$retries -lt 10) {
               $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
               Start-Sleep -Seconds 5
               $retries++
@@ -80,7 +99,7 @@ jobs:
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
           
           # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          $testResult = Test-NetConnection -ComputerName$env:TAILSCALE_IP -Port 3389
           if (-not $testResult.TcpTestSucceeded) {
               Write-Error "TCP connection to RDP port 3389 failed"
               exit 1
