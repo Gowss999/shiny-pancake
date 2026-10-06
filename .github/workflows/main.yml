@@ -1,121 +1,684 @@
-name: RDP
+name: Windows RDP + Tailscale + AI Tools
 
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+  id-token: write
+
 jobs:
-  secure-rdp:
+  windows-rdp:
+    name: Windows RDP Runner
     runs-on: windows-latest
-    timeout-minutes: 3600
+
+    # GitHub-hosted Windows runners are temporary.
+    # Keep this below the GitHub-hosted job limit.
+    timeout-minutes: 350
 
     steps:
-      - name: Configure Core RDP Settings
+
+      # ============================================================
+      # 1. CHECK SYSTEM
+      # ============================================================
+      - name: Check Windows Environment
+        shell: powershell
         run: |
-          # Enable Remote Desktop and disable Network Level Authentication (if needed)
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                             -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "SecurityLayer" -Value 0 -Force
+          Write-Host "======================================"
+          Write-Host "Windows Environment"
+          Write-Host "======================================"
 
-          # Remove any existing rule with the same name to avoid duplication
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
-          
-          # For testing, allow any incoming connection on port 3389
-          netsh advfirewall firewall add rule name="RDP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=3389
+          Get-ComputerInfo |
+            Select-Object `
+              WindowsProductName,
+              WindowsVersion,
+              OsArchitecture
 
-          # Restart the Remote Desktop service to ensure changes take effect
-          Restart-Service -Name TermService -Force
+          Write-Host ""
+          Write-Host "CPU:"
+          Get-CimInstance Win32_Processor |
+            Select-Object Name, NumberOfCores, NumberOfLogicalProcessors
 
-      - name: Create RDP User with Static Password
+          Write-Host ""
+          Write-Host "Memory:"
+          Get-CimInstance Win32_ComputerSystem |
+            Select-Object `
+              @{Name="RAM_GB";Expression={[math]::Round($_.TotalPhysicalMemory / 1GB,2)}}
+
+          Write-Host ""
+          Write-Host "Disk:"
+          Get-PSDrive -PSProvider FileSystem |
+            Select-Object Name,
+              @{Name="FreeGB";Expression={[math]::Round($_.Free / 1GB,2)}},
+              @{Name="UsedGB";Expression={[math]::Round(($_.Used) / 1GB,2)}}
+
+      # ============================================================
+      # 2. ENABLE RDP
+      # ============================================================
+      - name: Configure Remote Desktop
+        shell: powershell
         run: |
-          $password = '786gs$Az9_:1'
-          $securePass = ConvertTo-SecureString$password -AsPlainText -Force
+          Write-Host "Enabling Remote Desktop..."
 
-          # Create the RDP user with the specified static password
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name 'fDenyTSConnections' `
+            -Value 0 `
+            -Force
 
-          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+          # Keep Network Level Authentication enabled.
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'UserAuthentication' `
+            -Value 1 `
+            -Force
 
-          if (-not (Get-LocalUser -Name "RDP")) {
-              Write-Error "User creation failed"
+          # Use the normal RDP security layer.
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'SecurityLayer' `
+            -Value 1 `
+            -Force
+
+          # Enable Windows Firewall rules for Remote Desktop.
+          Enable-NetFirewallRule `
+            -DisplayGroup 'Remote Desktop'
+
+          Set-Service `
+            -Name 'TermService' `
+            -StartupType Automatic
+
+          Restart-Service `
+            -Name 'TermService' `
+            -Force
+
+          Write-Host "RDP configuration completed."
+
+      # ============================================================
+      # 3. CREATE RDP USER
+      # ============================================================
+      - name: Create RDP User
+        shell: powershell
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+              Write-Error "RDP_PASSWORD GitHub Secret is missing."
               exit 1
           }
 
-      - name: Install Software (LibreOffice, SumatraPDF, OmniRoute, Claude Code)
-        run: |
-          # 1. Install LibreOffice and SumatraPDF via Chocolatey
-          choco install libreoffice-fresh sumatrapdf -y --no-progress
+          Write-Host "Creating RDP user..."
 
-          # 2. Install Node.js & Claude Code CLI (@anthropic-ai/claude-code)
-          choco install nodejs-lts -y --no-progress
-          $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+          $securePassword = ConvertTo-SecureString `
+            $env:RDP_PASSWORD `
+            -AsPlainText `
+            -Force
+
+          # Remove an existing RDP user if present.
+          $existingUser = Get-LocalUser `
+            -Name 'RDP' `
+            -ErrorAction SilentlyContinue
+
+          if ($existingUser) {
+              Write-Host "Existing RDP user found."
+          }
+          else {
+              New-LocalUser `
+                -Name 'RDP' `
+                -Password $securePassword `
+                -AccountNeverExpires `
+                -PasswordNeverExpires:$false `
+                -Description 'Temporary GitHub Actions RDP user'
+
+              Write-Host "RDP user created."
+          }
+
+          # Add the user to Remote Desktop Users.
+          $rdpGroup = Get-LocalGroup `
+            -Name 'Remote Desktop Users' `
+            -ErrorAction Stop
+
+          $isMember = Get-LocalGroupMember `
+            -Group $rdpGroup `
+            -ErrorAction SilentlyContinue |
+            Where-Object {
+              $_.Name -match '\\RDP$'
+            }
+
+          if (-not $isMember) {
+              Add-LocalGroupMember `
+                -Group 'Remote Desktop Users' `
+                -Member 'RDP'
+          }
+
+          # Verify user.
+          Get-LocalUser -Name 'RDP'
+
+          Write-Host "RDP user configuration completed."
+
+      # ============================================================
+      # 4. INSTALL CHOCOLATEY
+      # ============================================================
+      - name: Install Chocolatey
+        shell: powershell
+        run: |
+          if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
+
+              Write-Host "Installing Chocolatey..."
+
+              Set-ExecutionPolicy `
+                Bypass `
+                -Scope Process `
+                -Force
+
+              [System.Net.ServicePointManager]::SecurityProtocol = `
+                [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
+
+              Invoke-Expression (
+                (New-Object System.Net.WebClient).DownloadString(
+                  'https://community.chocolatey.org/install.ps1'
+                )
+              )
+          }
+
+          $env:Path += ";C:\ProgramData\chocolatey\bin"
+
+          choco --version
+
+      # ============================================================
+      # 5. INSTALL BASIC SOFTWARE
+      # ============================================================
+      - name: Install Basic Software
+        shell: powershell
+        run: |
+          Write-Host "Installing basic software..."
+
+          choco install `
+            git `
+            python `
+            nodejs-lts `
+            7zip `
+            vscode `
+            libreoffice-fresh `
+            sumatrapdf `
+            -y `
+            --no-progress
+
+          Write-Host ""
+          Write-Host "Git:"
+          git --version
+
+          Write-Host ""
+          Write-Host "Python:"
+          python --version
+
+          Write-Host ""
+          Write-Host "Node:"
+          node --version
+
+          Write-Host ""
+          Write-Host "NPM:"
+          npm --version
+
+      # ============================================================
+      # 6. REFRESH PATH
+      # ============================================================
+      - name: Refresh PATH
+        shell: powershell
+        run: |
+          $machinePath = [
+            System.Environment
+          ]::GetEnvironmentVariable(
+            "Path",
+            "Machine"
+          )
+
+          $userPath = [
+            System.Environment
+          ]::GetEnvironmentVariable(
+            "Path",
+            "User"
+          )
+
+          $env:Path = "$machinePath;$userPath"
+
+          Write-Host "PATH refreshed."
+
+      # ============================================================
+      # 7. INSTALL CLAUDE CODE
+      # ============================================================
+      - name: Install Claude Code
+        shell: powershell
+        run: |
+          Write-Host "Installing Claude Code..."
+
           npm install -g @anthropic-ai/claude-code
 
-          # 3. Install OmniRoute
-          npm install -g omniroute || pip install omniroute || Write-Host "OmniRoute installation fallback"
+          Write-Host ""
+          Write-Host "Claude Code:"
+          claude --version
 
-          # 4. Create Desktop Shortcut for Google Anti-Gravity
-          $desktopPath = [Environment]::GetFolderPath("CommonDesktopDirectory")
-          $wshell = New-Object -ComObject WScript.Shell
-          $shortcut = $wshell.CreateShortcut("$desktopPath\Google Anti-Gravity.url")
-          $shortcut.TargetPath = "https://mrdoob.com/projects/chromeexperiments/google-space/"
-          $shortcut.Save()
+      # ============================================================
+      # 8. INSTALL OLLAMA
+      # ============================================================
+      - name: Install Ollama
+        shell: powershell
+        run: |
+          Write-Host "Installing Ollama..."
 
+          $installer = "$env:TEMP\OllamaSetup.exe"
+
+          Invoke-WebRequest `
+            -Uri "https://ollama.com/download/OllamaSetup.exe" `
+            -OutFile $installer
+
+          Start-Process `
+            -FilePath $installer `
+            -ArgumentList "/silent" `
+            -Wait
+
+          Remove-Item `
+            $installer `
+            -Force `
+            -ErrorAction SilentlyContinue
+
+          Write-Host "Ollama installation completed."
+
+      # ============================================================
+      # 9. START OLLAMA
+      # ============================================================
+      - name: Start Ollama
+        shell: powershell
+        run: |
+          $ollama = Get-Command ollama `
+            -ErrorAction SilentlyContinue
+
+          if (-not $ollama) {
+              $possiblePaths = @(
+                "$env:LOCALAPPDATA\Programs\Ollama\ollama.exe",
+                "$env:ProgramFiles\Ollama\ollama.exe"
+              )
+
+              foreach ($path in $possiblePaths) {
+                  if (Test-Path $path) {
+                      $ollama = $path
+                      break
+                  }
+              }
+          }
+
+          if (-not $ollama) {
+              Write-Error "Ollama executable not found."
+              exit 1
+          }
+
+          Write-Host "Ollama executable: $ollama"
+
+          # Start Ollama server.
+          Start-Process `
+            -FilePath $ollama `
+            -ArgumentList "serve" `
+            -WindowStyle Hidden
+
+          Start-Sleep -Seconds 10
+
+          Write-Host "Testing Ollama API..."
+
+          try {
+              $response = Invoke-RestMethod `
+                -Uri "http://127.0.0.1:11434/api/tags" `
+                -Method Get `
+                -TimeoutSec 15
+
+              Write-Host "Ollama API is running."
+              $response
+          }
+          catch {
+              Write-Warning "Ollama API did not respond yet."
+          }
+
+      # ============================================================
+      # 10. DOWNLOAD QWEN3
+      # ============================================================
+      - name: Pull Qwen3 8B
+        shell: powershell
+        run: |
+          $ollamaCommand = Get-Command ollama `
+            -ErrorAction SilentlyContinue
+
+          if (-not $ollamaCommand) {
+              Write-Warning "Ollama command not found."
+              exit 0
+          }
+
+          Write-Host "Downloading Qwen3 8B..."
+
+          ollama pull qwen3:8b
+
+          Write-Host ""
+          Write-Host "Installed Ollama models:"
+          ollama list
+
+      # ============================================================
+      # 11. INSTALL OMNIROUTE
+      # ============================================================
+      - name: Install OmniRoute
+        shell: powershell
+        continue-on-error: true
+        run: |
+          Write-Host "Installing OmniRoute..."
+
+          # Try npm first.
+          try {
+              npm install -g omniroute
+          }
+          catch {
+              Write-Warning "npm installation failed."
+          }
+
+          Write-Host ""
+          Write-Host "Checking OmniRoute..."
+
+          $omni = Get-Command omniroute `
+            -ErrorAction SilentlyContinue
+
+          if ($omni) {
+              omniroute --version
+          }
+          else {
+              Write-Warning `
+                "OmniRoute command was not found after installation."
+          }
+
+      # ============================================================
+      # 12. INSTALL TAILSCALE
+      # ============================================================
       - name: Install Tailscale
+        shell: powershell
         run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
-          
-          Invoke-WebRequest -Uri $tsUrl -OutFile$installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
+          Write-Host "Installing Tailscale..."
 
-      - name: Establish Tailscale Connection
+          $installer = "$env:TEMP\tailscale-setup.msi"
+
+          Invoke-WebRequest `
+            -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
+            -OutFile $installer
+
+          Start-Process `
+            -FilePath "msiexec.exe" `
+            -ArgumentList @(
+              "/i",
+              "`"$installer`"",
+              "/quiet",
+              "/norestart"
+            ) `
+            -Wait
+
+          Remove-Item `
+            $installer `
+            -Force `
+            -ErrorAction SilentlyContinue
+
+          Write-Host "Tailscale installed."
+
+      # ============================================================
+      # 13. CONNECT TAILSCALE
+      # ============================================================
+      - name: Connect Tailscale
+        shell: powershell
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
-          # Bring up Tailscale with the provided auth key and set a unique hostname
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
-          
-          # Wait for Tailscale to assign an IP
-          $tsIP = $null$retries = 0
-          while (-not $tsIP -and$retries -lt 10) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              Start-Sleep -Seconds 5
-              $retries++
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
+              Write-Error `
+                "TAILSCALE_AUTH_KEY GitHub Secret is missing."
+              exit 1
           }
-          
+
+          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $tailscale)) {
+              Write-Error "Tailscale executable not found."
+              exit 1
+          }
+
+          $hostname = "gh-rdp-$env:GITHUB_RUN_ID"
+
+          Write-Host "Connecting Tailscale..."
+          Write-Host "Hostname: $hostname"
+
+          & $tailscale up `
+            --authkey="$env:TAILSCALE_AUTHKEY" `
+            --hostname="$hostname"
+
+          if ($LASTEXITCODE -ne 0) {
+              Write-Error "Tailscale connection failed."
+              exit 1
+          }
+
+          Start-Sleep -Seconds 5
+
+          Write-Host ""
+          Write-Host "Tailscale status:"
+          & $tailscale status
+
+      # ============================================================
+      # 14. GET TAILSCALE IP
+      # ============================================================
+      - name: Get Tailscale IP
+        shell: powershell
+        run: |
+          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          $tsIP = $null
+
+          for ($i = 1; $i -le 20; $i++) {
+
+              Write-Host "Checking Tailscale IP - attempt $i/20"
+
+              $tsIP = & $tailscale ip -4 |
+                Select-Object -First 1
+
+              $tsIP = "$tsIP".Trim()
+
+              if ($tsIP) {
+                  break
+              }
+
+              Start-Sleep -Seconds 3
+          }
+
           if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
+              Write-Error "Tailscale IPv4 address was not obtained."
               exit 1
           }
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-      
-      - name: Verify RDP Accessibility
-        run: |
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          
-          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
-          $testResult = Test-NetConnection -ComputerName$env:TAILSCALE_IP -Port 3389
-          if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 failed"
-              exit 1
-          }
-          Write-Host "TCP connectivity successful!"
 
-      - name: Maintain Connection
+          Write-Host ""
+          Write-Host "======================================"
+          Write-Host "TAILSCALE IPv4"
+          Write-Host "$tsIP"
+          Write-Host "======================================"
+
+          "TAILSCALE_IP=$tsIP" |
+            Out-File `
+              -FilePath $env:GITHUB_ENV `
+              -Append
+
+      # ============================================================
+      # 15. VERIFY RDP SERVICE
+      # ============================================================
+      - name: Verify RDP
+        shell: powershell
         run: |
-          Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
-          Write-Host "Password: $(echo $env:RDP_CREDS)"
-          Write-Host "==================`n"
-          
-          # Keep runner active indefinitely (or until manually cancelled)
+          Write-Host "Checking RDP service..."
+
+          $service = Get-Service `
+            -Name TermService
+
+          Write-Host "TermService status: $($service.Status)"
+
+          if ($service.Status -ne "Running") {
+              Write-Error "Remote Desktop service is not running."
+              exit 1
+          }
+
+          Write-Host ""
+          Write-Host "Checking port 3389..."
+
+          $listener = Get-NetTCPConnection `
+            -LocalPort 3389 `
+            -State Listen `
+            -ErrorAction SilentlyContinue
+
+          if ($listener) {
+              Write-Host "RDP port 3389 is listening."
+          }
+          else {
+              Write-Warning `
+                "Port 3389 was not detected as listening."
+          }
+
+      # ============================================================
+      # 16. VERIFY TAILSCALE → RDP
+      # ============================================================
+      - name: Test RDP Connectivity
+        shell: powershell
+        run: |
+          Write-Host "Testing:"
+          Write-Host "$env:TAILSCALE_IP : 3389"
+
+          $result = Test-NetConnection `
+            -ComputerName $env:TAILSCALE_IP `
+            -Port 3389 `
+            -WarningAction SilentlyContinue
+
+          $result |
+            Select-Object `
+              ComputerName,
+              RemotePort,
+              TcpTestSucceeded
+
+          if (-not $result.TcpTestSucceeded) {
+              Write-Warning `
+                "RDP connectivity test failed."
+              Write-Warning `
+                "This does not necessarily mean external RDP cannot connect."
+          }
+          else {
+              Write-Host "RDP connectivity test succeeded."
+          }
+
+      # ============================================================
+      # 17. DISPLAY CONNECTION INFORMATION
+      # ============================================================
+      - name: Display RDP Information
+        shell: powershell
+        run: |
+          Write-Host ""
+          Write-Host "=============================================="
+          Write-Host "           WINDOWS RDP ACCESS"
+          Write-Host "=============================================="
+          Write-Host ""
+          Write-Host "Tailscale IP : $env:TAILSCALE_IP"
+          Write-Host "RDP Address  : $env:TAILSCALE_IP"
+          Write-Host "RDP Port     : 3389"
+          Write-Host "Username     : RDP"
+          Write-Host ""
+          Write-Host "Use Windows Remote Desktop:"
+          Write-Host ""
+          Write-Host "    mstsc"
+          Write-Host ""
+          Write-Host "Then connect to:"
+          Write-Host ""
+          Write-Host "    $env:TAILSCALE_IP"
+          Write-Host ""
+          Write-Host "Password:"
+          Write-Host "    Use the value stored in GitHub Secret RDP_PASSWORD"
+          Write-Host ""
+          Write-Host "=============================================="
+
+      # ============================================================
+      # 18. SHOW INSTALLED AI SOFTWARE
+      # ============================================================
+      - name: Verify AI Environment
+        shell: powershell
+        continue-on-error: true
+        run: |
+          Write-Host ""
+          Write-Host "======================================"
+          Write-Host "AI ENVIRONMENT"
+          Write-Host "======================================"
+
+          Write-Host ""
+          Write-Host "Node:"
+          node --version
+
+          Write-Host ""
+          Write-Host "Python:"
+          python --version
+
+          Write-Host ""
+          Write-Host "Git:"
+          git --version
+
+          Write-Host ""
+          Write-Host "Claude:"
+          claude --version
+
+          Write-Host ""
+          Write-Host "Ollama:"
+          ollama --version
+
+          Write-Host ""
+          Write-Host "Ollama Models:"
+          ollama list
+
+          Write-Host ""
+          Write-Host "OmniRoute:"
+          $omni = Get-Command omniroute `
+            -ErrorAction SilentlyContinue
+
+          if ($omni) {
+              omniroute --version
+          }
+          else {
+              Write-Host "OmniRoute command not available."
+          }
+
+      # ============================================================
+      # 19. KEEP RUNNER ALIVE
+      # ============================================================
+      - name: Keep RDP Session Alive
+        shell: powershell
+        run: |
+          Write-Host ""
+          Write-Host "=============================================="
+          Write-Host "RDP SESSION IS READY"
+          Write-Host "=============================================="
+          Write-Host ""
+          Write-Host "Tailscale IP : $env:TAILSCALE_IP"
+          Write-Host "Username     : RDP"
+          Write-Host ""
+          Write-Host "The runner will remain alive until the"
+          Write-Host "GitHub Actions job reaches its timeout"
+          Write-Host "or the workflow is manually cancelled."
+          Write-Host ""
+
           while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+
+              Write-Host ""
+              Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')]"
+              Write-Host "RDP runner active."
+
+              # Show Tailscale status periodically.
+              $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+              if (Test-Path $tailscale) {
+                  $ip = & $tailscale ip -4 |
+                    Select-Object -First 1
+
+                  Write-Host "Tailscale IP: $ip"
+              }
+
               Start-Sleep -Seconds 300
           }
